@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:hydrated_bloc/hydrated_bloc.dart';
 import '../../data/repositories/hybrid_notes_repository.dart';
 import '../../data/models/notes_model.dart';
@@ -7,6 +9,8 @@ import '../../data/models/pending_operation.dart';
 
 class NotesBloc extends HydratedBloc<NotesEvent, NotesState> {
   final HybridNotesRepository repository;
+  Timer? _retryTimer;
+  bool _isProcessing = false;
 
   NotesBloc(this.repository) : super(const NotesState()) {
     on<FetchNotesEvent>(_onFetchNotes);
@@ -17,16 +21,34 @@ class NotesBloc extends HydratedBloc<NotesEvent, NotesState> {
     on<ToggleSelectionModeEvent>(_onToggleSelectionMode);
     on<SelectAllNotesEvent>(_onSelectAllNotes);
     on<ToggleNoteSelectionEvent>(_onToggleNoteSelection);
+
+    _retryTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
+      try {
+        if (_isProcessing) return;
+        if (state.pendingOperations.isEmpty) return;
+        _isProcessing = true;
+        final available = await repository.isBackendAvailable();
+        if (available) {
+          add(const ProcessPendingQueueEvent());
+        }
+      } finally {
+        _isProcessing = false;
+      }
+    });
+  }
+
+  @override
+  Future<void> close() {
+    _retryTimer?.cancel();
+    return super.close();
   }
 
   Future<void> _onFetchNotes(FetchNotesEvent event, Emitter<NotesState> emit) async {
     emit(state.copyWith(isLoading: true, error: null));
     try {
       final notes = await repository.getNotes();
-      // If fetch succeeds, merge server notes with local notes and try flushing pending ops
   final merged = _mergeServerAndLocal(notes, state.notes);
   emit(state.copyWith(notes: merged, isLoading: false));
-      // After fetch success attempt to flush pending queue
       add(const ProcessPendingQueueEvent());
     } catch (e) {
       emit(state.copyWith(isLoading: false, error: 'Using offline mode'));
@@ -39,9 +61,13 @@ class NotesBloc extends HydratedBloc<NotesEvent, NotesState> {
     emit(state.copyWith(notes: updatedNotes));
 
     try {
-      await repository.addNote(event.title, event.body);
+      final created = await repository.addNote(event.title, event.body);
+      if (created != null) {
+        // replace temp note with server-created note
+        final replaced = updatedNotes.map((n) => n.id == newNote.id ? created : n).toList();
+        emit(state.copyWith(notes: replaced));
+      }
     } catch (e) {
-      // enqueue pending add operation so it will be retried later
       final op = PendingOperation(type: 'add', note: newNote.toJson());
       final pending = [...state.pendingOperations, op];
       emit(state.copyWith(error: 'Note saved locally (offline mode)', pendingOperations: pending));
@@ -81,7 +107,6 @@ class NotesBloc extends HydratedBloc<NotesEvent, NotesState> {
         await repository.delete(note.id);
       }
     } catch (e) {
-      // enqueue delete operations for each selected note
       final deletes = event.selectedNotes.map((n) => PendingOperation(type: 'delete', note: n.toJson()));
       final pending = [...state.pendingOperations, ...deletes];
       emit(state.copyWith(error: 'Notes deleted locally (offline mode)', pendingOperations: pending));
@@ -92,30 +117,39 @@ class NotesBloc extends HydratedBloc<NotesEvent, NotesState> {
     if (state.pendingOperations.isEmpty) return;
 
     final remaining = <PendingOperation>[];
+    var notesMutable = List<Notes>.from(state.notes);
 
     for (var op in state.pendingOperations) {
       try {
         final noteJson = op.note;
         if (op.type == 'add') {
-          await repository.addNote(noteJson['title'] as String, noteJson['body'] as String);
+          final created = await repository.addNote(noteJson['title'] as String, noteJson['body'] as String);
+          if (created != null) {
+            final tempId = noteJson['id'] as int;
+            // replace temp id with server id in local notes
+            notesMutable = notesMutable.map((n) => n.id == tempId ? created : n).toList();
+            // update any pending operations (in-place) that reference the temp id
+            for (var p in state.pendingOperations) {
+              if (p.note['id'] == tempId) p.note['id'] = created.id;
+            }
+          }
         } else if (op.type == 'update') {
           await repository.update(noteJson['id'] as int, noteJson['title'] as String, noteJson['body'] as String);
         } else if (op.type == 'delete') {
           await repository.delete(noteJson['id'] as int);
         }
       } catch (e) {
-        // keep in remaining queue for future retries
         remaining.add(op);
       }
     }
 
-    if (remaining.length != state.pendingOperations.length) {
-      emit(state.copyWith(pendingOperations: remaining, error: remaining.isEmpty ? null : state.error));
+    // emit once with updated notes and pending queue
+    if (remaining.length != state.pendingOperations.length || notesMutable != state.notes) {
+      emit(state.copyWith(notes: notesMutable, pendingOperations: remaining, error: remaining.isEmpty ? null : state.error));
     }
   }
 
   List<Notes> _mergeServerAndLocal(List<Notes> server, List<Notes> local) {
-    // Simple merge: prefer server items, but include local-only items (by id mismatch)
     final Map<int, Notes> map = {for (var n in server) n.id: n};
     for (var n in local) {
       if (!map.containsKey(n.id)) map[n.id] = n;
