@@ -10,13 +10,13 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:frontend/main.dart';
 import 'package:frontend/notes/data/services/notes_services.dart';
-import 'package:frontend/notes/data/repositories/notes_repository.dart';
+import 'package:frontend/notes/data/repositories/hybrid_notes_repository.dart';
 
 void main() {
   testWidgets('Counter increments smoke test', (WidgetTester tester) async {
     // Build our app and trigger a frame.
-    final repository = NotesRepository(NotesService());
-    await tester.pumpWidget(MyApp(repository: repository));
+  final repository = HybridNotesRepository(NotesService());
+  await tester.pumpWidget(MyApp(repository: repository));
 
     // Verify that our counter starts at 0.
     expect(find.text('0'), findsOneWidget);

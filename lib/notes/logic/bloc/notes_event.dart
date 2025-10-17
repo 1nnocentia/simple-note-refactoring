@@ -42,3 +42,7 @@ class ToggleNoteSelectionEvent extends NotesEvent {
   
   const ToggleNoteSelectionEvent({required this.note});
 }
+
+class ProcessPendingQueueEvent extends NotesEvent {
+  const ProcessPendingQueueEvent();
+}
